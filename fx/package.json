@@ -1,0 +1,44 @@
+{
+  "name": "fx-ts",
+  "version": "0.1.0",
+  "description": "True algebraic effects for JavaScript & TypeScript — resumable continuations, typed effect rows, structured concurrency",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "algebraic-effects",
+    "effect-handlers",
+    "structured-concurrency",
+    "continuations",
+    "async",
+    "control-flow",
+    "typescript",
+    "functional-programming"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

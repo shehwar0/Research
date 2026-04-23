@@ -1,0 +1,25 @@
+{
+  "Getting Started": [
+    ["installation.mdx", "Installation"],
+    ["typescript.mdx", "TypeScript"],
+    ["thinking-in-effection.mdx", "Thinking in Effection"],
+    ["async-rosetta-stone.mdx", "Async Rosetta Stone"],
+    ["tutorial.mdx", "Tutorial"],
+    ["upgrade.mdx", "Upgrading from V3"]
+  ],
+  "Learn Effection": [
+    ["operations.mdx", "Operations"],
+    ["spawn.mdx", "Spawn"],
+    ["resources.mdx", "Resources"],
+    ["collections.mdx", "Streams and Subscriptions"],
+    ["events.mdx", "Events"],
+    ["errors.mdx", "Error Handling"],
+    ["context.mdx", "Context"],
+    ["actions.mdx", "Actions"]
+  ],
+  "Advanced": [
+    ["faq.mdx", "FAQ"],
+    ["scope.mdx", "Scope"],
+    ["processes.mdx", "Processes"]
+  ]
+}

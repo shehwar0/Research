@@ -1,0 +1,381 @@
+import type { Result } from "./result.ts";
+
+/**
+ * An `Operation` in Effection describes an abstract computation. An operation
+ * does not do anything on its own. Rather, it only describes the steps it will
+ * take when it runs.
+ *
+ * In the Effection world, `Operation` occupies the same position as `Promise`
+ * does the world of async/await.
+ *
+ * An operation can be created with a generator function that only does `yield*`
+ * to other operations:
+ *
+ * @example
+ * ```javascript
+ * import { sleep } from "effection";
+
+ * function* slow5(seconds) {
+ *   yield* sleep(seconds * 1000);
+ *   return 5;
+ * }
+ * ```
+ *
+ * Operations can also be created using `Symbol.iterator`. The following
+ * operation is the same as above:
+ *
+ * @example
+ * ```javascript
+ * import { sleep } from "effection";
+ *
+ * const slow5 = (seconds) => ({
+ *   *[Symbol.iterator]() {
+ *     yield* sleep(seconds * 1000);
+ *     return 5;
+ *   }
+ * })
+ * ```
+ *
+ * See [Operations guide](https://frontside.com/effection/docs/operations) for more information.
+ * @since 3.0
+ */
+export interface Operation<T> {
+  [Symbol.iterator](): Iterator<Effect<unknown>, T, unknown>;
+}
+
+/**
+ * A value that is both an {@link Operation} _and_ `Promise`.
+ *
+ * Futures are operations that are implicitly associated with an Effection scope
+ * and so they can be freely `await`ed within any async functions. However, they
+ * can also be evaluated directly within another operation, so among other
+ * things, if the operation resolves synchronously, it will continue within the
+ * same tick of the run loop.
+ * @since 3.0
+ */
+export interface Future<T> extends Operation<T>, Promise<T> {}
+
+/**
+ * A handle to a concurrently running operation that lets you either use the
+ * result of that operation, or shut it down.
+ *
+ * When it is run or spawned, an operation executes concurrently with
+ * the rest of the program. The `Task` is both an {@link Operation} and a
+ * `Promise` that lets you consume the result of that operation.
+ *
+ * @example
+ * ```javascript
+ * import { run, sleep } from "effection";
+ *
+ * let task = run(function*() {
+ *   yield* sleep(100);
+ *   return "hello world"
+ * });
+ *
+ * console.log(await task); //=> "hello world"
+ * ```
+ *
+ * A task can also be created from within an operation by using the
+ * {@link spawn()} operation.
+ *
+ * @example
+ * ```javascript
+ * import { run, spawn, sleep } from "effection";
+ *
+ * await run(function*() {
+ *   let task = yield* spawn(function*() {
+ *     yield* sleep(100);
+ *     return "hello world";
+ *   });
+ *   console.log(yield* task;) //=> "hello world"
+ * });
+ * ```
+ *
+ * Note tasks are subject to the strict guarantees of structured concurrency
+ * and will never outlive their parent. For example, the following spawned task
+ * will never log any output to the console.
+ *
+ * @example
+ * ```javascript
+ * import { run, spawn, sleep } from "effection";
+ *
+ * await run(function*() {
+ *   yield* spawn(function*() {
+ *     yield* sleep(100);
+ *     console.log("hello world");
+ *   });
+ *   // <--- returns here, so spawned task is shut down as it sleeps.
+ * });
+ * ```
+ *
+ * See the guide on [Scopes](https://frontside.com/effection/docs/scope) for
+ * more detail.
+ *
+ * If a `Task` is halted before it finishes executing, then consuming it's
+ * result is an Error.
+ *
+ * @example
+ * ```javascript
+ * import { run, spawn, sleep } from "effection";
+ *
+ * await run(function*() {
+ *  let task = yield* spawn(function*() {
+ *    yield* sleep(100);
+ *    return "hello world";
+ *  });
+ *  yield* task.halt();
+ *  let output = yield* task; //=> throws Error("halted");
+ *  console.log(output);
+ * });
+ * ```
+ *
+ * @see {@link run}
+ * @see {@link spawn}
+ * @see {@link Scope.run}
+ * @since 3.0
+ */
+export interface Task<T> extends Future<T> {
+  /**
+   * Interrupt and shut down a running {@link Operation} and all of its
+   * children.
+   *
+   * Any errors raised by the `halt()` operation only represent problems that
+   * occured during the teardown of the task. In other words, `halt()` can
+   * succeed even if the task failed.
+   *
+   * @returns a future that only resolves when all shutdown associated with this
+   * Task is complete.
+   */
+  halt(): Future<void>;
+
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
+/**
+ * The Effection equivalent of an [`AsyncIterator`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/AsyncIterator)
+ *
+ * A subscription acts like a stateful queue that provides a sequence of values
+ * via the next() method. Normally a subscription is created via a
+ * {@link Stream}.
+ *
+ * @see https://effection.deno.dev/docs/collections#subscription
+ * @since 3.0
+ */
+export interface Subscription<T, TDone> {
+  next(): Operation<IteratorResult<T, TDone>>;
+}
+
+/**
+ * The Effection equivalent of an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols).
+ *
+ * Like async iterables, streams do not actually have state themselves, but
+ * contain the recipe for how to create a {@link Subscription}
+ *
+ * @see https://frontside.com/effection/docs/collections#stream
+ * @since 3.0
+ */
+export type Stream<T, TReturn> = Operation<Subscription<T, TReturn>>;
+
+/**
+ * `Context` defines a value which is in effect for a given scope which is an
+ * (action, resource, call, or spawn).
+ *
+ * Unless a context value is defined for a particular scope, it will inherit
+ * its value from its parent scope.
+ * @since 3.0
+ */
+export interface Context<T> {
+  /**
+   * A unique identifier for this context.
+   */
+  name: string;
+  /**
+   * The value returned by this context when it is not present on a scop.e
+   */
+  defaultValue?: T;
+
+  /**
+   * Read the current value of this context if it exists.
+   *
+   * @returns an operation that yields the current value if it exists, or undefined otherwise.
+   * @see {@link Scope#get} for reading a context value outside of a running operation
+   */
+  get(): Operation<T | undefined>;
+
+  /**
+   * Set the value of a context on the current scope. It will not effect the value of its
+   * containing scope and will only be visible by this scope and its children.
+   *
+   * @returns an operation yielding the value being set
+   * @see {@link Scope#set} for setting a context value outside of a running operation
+   */
+  set(value: T): Operation<T>;
+
+  /**
+   * Read the current value of the context or fail if it does not exist
+   *
+   * @returns an operation that yields the context value
+   * @see {@link Scope#expect} for reading a required context value outside of a running operation
+   */
+  expect(): Operation<T>;
+
+  /**
+   * Remove a context value from the current scope. This will only effect the current scope and
+   * not its parent value.
+   *
+   * @returns true if the value existed uniquely on this scope.
+   */
+  delete(): Operation<boolean>;
+
+  /**
+   * Evaluate an operation using `value` for the context. Once the operation is completed, the context
+   * will be reverted to its original value, or removed if it was not present originally.
+   *
+   * @example
+   * ```ts
+   * let user = yield* login();
+   * yield* UserContext.with(user, function*() {
+   *   //do stuff
+   * })
+   * ```
+   *
+   * @returns the result of evaluating the operation.
+   */
+  with<R>(value: T, operation: (value: T) => Operation<R>): Operation<R>;
+}
+
+/**
+ * A programatic API to interact with an Effection scope from outside of an
+ * {@link Operation}.
+ *
+ * Most often this is used to integrate external APIs with Effection by
+ * capturing a `Scope` from a running operation with {@link useScope}, and then
+ * using it to call back into itself from a callback.
+ *
+ * The following example calls into Effection to implement a proxy around a
+ * google search by using [express.js](https://expressjs.com).
+ *
+ * @example
+ * ```javascript
+ * import { main, useScope, suspend } from "effection";
+ * import { express } from "express";
+ *
+ * await main(function*() {
+ *   let scope = yield* useScope();
+ *   express().get("/", (req, resp) => {
+ *     return scope.run(function*() {
+ *       let signal = yield* useAbortSignal();
+ *       let response = yield* fetch(`https://google.com?q=${req.params.q}`, { signal });
+ *       resp.send(yield* response.text());
+ *     });
+ *   });
+ *   yield* suspend();
+ * });
+ * ```
+ * @since 3.0
+ */
+export interface Scope {
+  /**
+   * Run an {@link Operation} within `Scope`.
+   *
+   * This is used to create concurrent tasks from _outside_ of a running
+   * operation. To create concurrent tasks from _within_ an already
+   * running operation, use {@link Scope#spawn}
+   *
+   * @param operation - the operation to run
+   * @returns a task of the running operation
+   */
+  run<T>(operation: () => Operation<T>): Task<T>;
+
+  /**
+   * Spawn an {@link Operation} within `Scope`.
+   *
+   * This is used to create concurrent tasks from _within_ a running
+   * operation. To create concurrent from outside of Effection, use
+   * {@link Scope#run}
+   */
+  spawn<T>(operation: () => Operation<T>): Operation<Task<T>>;
+
+  /**
+   * Get a {@link Context} value from outside of an operation.
+   *
+   * @param context - the context to get
+   * @returns the value of that context in this scope if it exists
+   */
+  get<T>(context: Context<T>): T | undefined;
+
+  /**
+   * Set the value of a {@link Context} from outside of an operation
+   *
+   * @param context - the context to set
+   * @param value - the value to set for this context
+   * @returns - the value that was set
+   */
+  set<T>(context: Context<T>, value: T): T;
+
+  /**
+   * Get a {@link Context} value from outside of an operation, and throw
+   * a `MissingContextError` if this context is not specified for this scope.
+   *
+   * @param context - the context to get
+   * @returns the value of that context in this scope if it exists
+   */
+  expect<T>(context: Context<T>): T;
+
+  /**
+   * Remove a {@link Context} value from this scope.
+   *
+   * @param context - the context to delete
+   */
+  delete<T>(context: Context<T>): boolean;
+
+  /**
+   * Check if scope has its own unique value for `context`.
+   *
+   * @returns `true` if scope has its own context, `false` if context is not present, or inherited from its parent.
+   */
+  hasOwn<T>(context: Context<T>): boolean;
+}
+
+/**
+ * Unwrap the type of an `Operation`.
+ * Analogous to the built in [`Awaited`](https://www.typescriptlang.org/docs/handbook/utility-types.html#awaitedtype) type.
+ * `Yielded<Operation<T>> === T`
+ * @since 3.1
+ */
+export type Yielded<T extends Operation<unknown>> = T extends
+  Operation<infer TYield> ? TYield
+  : never;
+
+// low-level private apis.
+
+/**
+ * @ignore
+ */
+export interface Effect<T> {
+  description: string;
+  enter(
+    resolve: Resolve<Result<T>>,
+    routine: Coroutine,
+  ): (resolve: Resolve<Result<void>>) => void;
+}
+
+/**
+ * @ignore
+ */
+export interface Coroutine<T = unknown> {
+  scope: Scope;
+  data: {
+    exit(resolve: Resolve<Result<unknown>>): void;
+    iterator: Iterator<Effect<unknown>, T, unknown>;
+  };
+  next(result: Result<unknown>): void;
+  return<R>(result: Result<R>): void;
+}
+
+/**
+ * @ignore
+ */
+export interface Resolve<T> {
+  (value: T): void;
+}

@@ -1,0 +1,526 @@
+[0] [Normal] Algebraic Effects for Async Control Flow
+[1] [Normal] in JavaScript & TypeScript
+[2] [Normal] Startup Feasibility · Language Survey · Research Landscape · Library Gap Analysis · 
+[3] [Normal] 
+[4] [Normal] 
+[5] [Heading 1] Executive Summary
+[6] [Normal] This report is a comprehensive, extensively researched deep-dive into the problem of algebraic effects for asynchronous control flow in JavaScript and TypeScript. It assesses the startup opportunity, surveys all existing solutions and their critical gaps, catalogues the academic research landscape through 2026, documents the latest developments in the ecosystem, and outlines a rigorous technical roadmap for building a production-grade open-source library.
+[7] [Normal] 
+[8] [Normal] 
+[9] [Heading 3] Key Findings at a Glance — April 2026
+[10] [List Paragraph] Effect v4 Beta (February 2026): Rewritten runtime, 70KB → 20KB bundle, unified package system with 17 unstable modules (AI, HTTP, SQL, workflows, clustering). Monadic model — not true resumable effects.
+[11] [List Paragraph] Effection v4 (December 2025): New major release addressing v3's limitations with explicit scope management, native JS stack traces, and the EffectionX extensions library. Still generator-based, one-shot only.
+[12] [List Paragraph] WasmFX / Stack Switching: Being standardized in the WebAssembly Stack Switching subgroup as of 2025. Implementation exists in wasmtime and wasm-tools. Platform-level support is converging.
+[13] [List Paragraph] TypeScript Go Compiler (2025–2026): Microsoft is rewriting tsc in Go (TypeScript 6.0 will be the last TS-in-TS version). 10x speed improvement incoming. Opens the door for more complex type-level effect tracking.
+[14] [List Paragraph] Effect + AI Agent Orchestration: The @effect/ai SDK and community projects (Lalph, DynamicFlow) show algebraic effects are the natural primitive for AI agent orchestration — a massive new use case.
+[15] [List Paragraph] No TC39 Proposal: As of April 2026, there remains no formal TC39 proposal for native algebraic effects at any stage of the standardization process.
+[16] [List Paragraph] Rich academic literature (2024–2025): New papers on Lexical Effect Handlers (OOPSLA 2025), Asynchronous Effects (LMCS 2024), and Equational Axiomatization (POPL 2026) continue to advance the theoretical frontier.
+[17] [Normal] 
+[18] [Normal] 
+[19] [Heading 1] 1. The Problem — Why JavaScript Async Is Broken
+[20] [Heading 2] 1.1 The Layered Mess of JavaScript's Async Evolution
+[21] [Normal] JavaScript's asynchronous programming model has evolved through at least five distinct paradigms since 1995, each bolted onto the previous without ever replacing it. The result is a language where there is no single, coherent primitive for expressing asynchronous intent. Each iteration solved surface ergonomics while leaving the fundamental architectural flaws intact.
+[22] [Normal] 
+[23] [Normal] 
+[24] [Heading 2] 1.2 The Four Fundamental Failures — Deep Analysis
+[25] [Heading 3] 1.2.1 No True Cancellation
+[26] [Normal] AbortController is a bolt-on solution that requires manual threading of a signal through every async call. It does not propagate automatically, has no connection to the call-stack lifetime, and does not compose with error handling. There is no built-in way to say "cancel this entire tree of operations if any sub-operation fails" — which is the defining property of structured concurrency.
+[27] [Normal] The deeper issue: once asynchronous work is scheduled in JavaScript, there is no general mechanism to forcibly stop it. AbortController provides a signal that well-behaved code can observe — but it is a convention, not an enforcement mechanism. Promises, callbacks, and async functions represent results and continuations, not ownership of the underlying execution.
+[28] [Normal] 
+[29] [Normal] // AbortController: the bolt-on cancellation solution
+[30] [Normal] async function fetchWithTimeout(url, timeoutMs) {
+[31] [Normal]   const controller = new AbortController();
+[32] [Normal]   const id = setTimeout(() => controller.abort(), timeoutMs);
+[33] [Normal]   try {
+[34] [Normal]     const response = await fetch(url, { signal: controller.signal });
+[35] [Normal]     return await response.json();
+[36] [Normal]   } finally {
+[37] [Normal]     clearTimeout(id);  // must manually clean up
+[38] [Normal]   }
+[39] [Normal] }
+[40] [Normal]  
+[41] [Normal] // Problem: AbortController must be MANUALLY passed through every layer:
+[42] [Normal] async function loadDashboard(userId, signal) {  // must accept signal
+[43] [Normal]   const user = await getUser(userId, signal);    // must forward signal
+[44] [Normal]   const orders = await getOrders(userId, signal); // must forward signal
+[45] [Normal]   // ... every function in the chain must be modified
+[46] [Normal] }
+[47] [Normal] 
+[48] [Heading 3] 1.2.2 No Structured Concurrency
+[49] [Normal] Structured concurrency is a programming paradigm pioneered in Kotlin (coroutines/CoroutineScope), Swift (task groups), Python 3.11 (TaskGroup), and Java 21 (Project Loom virtual threads). The core principle: the lifetime of concurrent tasks is lexically scoped — a task group cannot outlive the scope that created it, and if any task fails, all sibling tasks are automatically cancelled.
+[50] [Normal] JavaScript has none of this. Promise.all(), Promise.allSettled(), and Promise.race() are utility combinators, not a concurrency model. The classic failure mode is the "ghost task" problem — abandoned async computations consuming CPU, memory, and network after the calling code has moved on.
+[51] [Normal] 
+[52] [Normal] // Classic unstructured concurrency: the ghost task problem
+[53] [Normal] async function processUser(id) {
+[54] [Normal]   const userFetch = fetch(`/api/user/${id}`);  // orphaned — no owner, never cancels
+[55] [Normal]   throw new Error('early exit');              // fetch still runs, wastes resources
+[56] [Normal]   const user = await userFetch;
+[57] [Normal] }
+[58] [Normal]  
+[59] [Normal] // With Promise.all: one rejection does NOT cancel the others
+[60] [Normal] async function loadDashboard(userId) {
+[61] [Normal]   const [user, orders, analytics] = await Promise.all([
+[62] [Normal]     getUser(userId),
+[63] [Normal]     getOrders(userId),   // throws an error after 2 seconds
+[64] [Normal]     getAnalytics(userId) // STILL RUNNING! Never cancelled! Resource leak!
+[65] [Normal]   ]);
+[66] [Normal] }
+[67] [Normal] 
+[68] [Heading 3] 1.2.3 Error Propagation Chaos — Three Incompatible Channels
+[69] [Normal] JavaScript developers must navigate three distinct and incompatible error propagation mechanisms simultaneously. This fragmentation is not just aesthetic — it is a source of real bugs. A try/catch block around an async call that omits await silently fails to catch Promise rejections. Prof. Yizhou Zhang (Cornell/Waterloo) identified this as a critical safety gap: asynchronous exceptions are easily dropped since neither C# nor JavaScript statically checks exception types.
+[70] [Normal] 
+[71] [Normal] 
+[72] [Heading 3] 1.2.4 No Resumable Control Flow — The Deepest Limitation
+[73] [Normal] This is the most fundamental limitation — the one that makes true algebraic effects impossible to polyfill without engine changes. When JavaScript executes a throw statement, the engine walks the call stack upward, destroying each stack frame until it finds a matching catch clause. This process is irreversible.
+[74] [Normal] Algebraic effects require the opposite behavior: perform suspends execution and preserves the entire suspended call stack as a delimited continuation. The handler receives the continuation as a first-class value and can choose to resume it, ignore it, or resume it multiple times. This requires engine-level support that does not exist in any JavaScript engine today.
+[75] [Normal] 
+[76] [Normal] // HYPOTHETICAL algebraic effects syntax — does not exist natively in JS
+[77] [Normal] function fetchUser(id) {
+[78] [Normal]   if (!cache.has(id)) {
+[79] [Normal]     const user = perform Fetch('/api/user/' + id);  // suspend here
+[80] [Normal]     cache.set(id, user);                             // resume here after handler runs
+[81] [Normal]   }
+[82] [Normal]   return cache.get(id);
+[83] [Normal] }
+[84] [Normal]  
+[85] [Normal] // The SAME function code, three completely different runtime behaviors:
+[86] [Normal] withHandler(realFetchHandler,  () => fetchUser(42));  // real HTTP
+[87] [Normal] withHandler(mockFetchHandler,  () => fetchUser(42));  // test mock, zero network
+[88] [Normal] withHandler(cacheFetchHandler, () => fetchUser(42));  // cache-first strategy
+[89] [Normal] 
+[90] [Heading 3] 1.2.5 The Function Coloring Problem (Nystrom 2015 — Extended Analysis)
+[91] [Normal] In 2015, Bob Nystrom published "What Color is Your Function?" articulating a deep architectural problem: in languages like JavaScript, functions have a "color." Blue functions are synchronous. Red functions are async. The rules are asymmetric: async functions can call both types, but synchronous functions cannot call async functions in a value-extracting way. Every async function is "viral" — it infects every caller up the entire call stack.
+[92] [Normal] This creates cascading refactors across entire codebases. If a previously synchronous operation (e.g., reading a config value) becomes asynchronous, every function that called it must be updated. This is not just ergonomic nuisance — it is an architectural constraint that bleeds async concerns into layers of code that should be implementation-agnostic.
+[93] [Normal] 
+[94] [Normal] // The function color problem in action
+[95] [Normal] // Later, getConfig() becomes async. Now EVERY caller must become async:
+[96] [Normal] async function getConfig() { /* was sync, now async */ }
+[97] [Normal]  
+[98] [Normal] // This function must now be async...
+[99] [Normal] async function initApp() {
+[100] [Normal]   const config = await getConfig();
+[101] [Normal]   // ...and so must every function that calls initApp()...
+[102] [Normal] }
+[103] [Normal]  
+[104] [Normal] // The map() problem: Array.map does not understand async
+[105] [Normal] const users = ['alice', 'bob', 'charlie'];
+[106] [Normal] // This DOES NOT WORK as expected:
+[107] [Normal] const names = users.map(async user => await fetchName(user));
+[108] [Normal] // names is Array<Promise<string>>, not Array<string>
+[109] [Normal] // You need Promise.all(users.map(...)) — awkward and error-prone
+[110] [Normal] 
+[111] [Normal] 
+[112] [Heading 1] 2. Algebraic Effects — Theoretical Foundations
+[113] [Heading 2] 2.1 Origins and Mathematical Basis
+[114] [Normal] Algebraic effects were introduced by Gordon Plotkin and John Power in 2001–2003, and extended with effect handlers by Plotkin and Matija Pretnar in 2009–2013. The original work emerged from category theory and denotational semantics — a branch of theoretical computer science studying how programming language constructs can be given rigorous mathematical meaning.
+[115] [Normal] The central insight: many computational side effects — reading/writing state, raising exceptions, performing I/O, generating random numbers, iterating — share a common algebraic structure. They can all be described as operations in an algebraic theory, and their semantics can be defined by giving handlers (interpretations) for those operations. This is directly analogous to how algebraic data types (like Option or Result) give a unified structure to data modeling.
+[116] [Normal] 
+[117] [Heading 2] 2.2 Core Primitives
+[118] [Normal] 
+[119] [Heading 2] 2.3 One-Shot vs. Multi-Shot Continuations — The Design Choice That Defines Everything
+[120] [Normal] This is the most practically important design choice for any JavaScript implementation of algebraic effects. The decision affects performance, expressiveness, implementation complexity, and the class of programs the library can express.
+[121] [Normal] 
+[122] [Normal] 
+[123] [Normal] 
+[124] [Heading 2] 2.4 Why Algebraic Effects Are Strictly More Powerful Than Exceptions
+[125] [Normal] The comparison between algebraic effects and traditional try/catch exceptions is not merely stylistic — it reflects a fundamental difference in computational power. Understanding this distinction is critical to understanding why a new language primitive (or library) is necessary.
+[126] [Normal] 
+[127] [Normal] 
+[128] [Normal] 
+[129] [Heading 1] 3. Language Survey — Who Solved This Best and How
+[130] [Normal] Six languages have implemented algebraic effects natively or near-natively. Each provides critical lessons for a JavaScript library implementation. The architectural choices they made — particularly around type systems, compilation strategies, and continuation semantics — are directly applicable to TypeScript.
+[131] [Heading 2] 3.1 Koka (Microsoft Research) — The Gold Standard
+[132] [Normal] Koka is a strict functional language designed from scratch by Daan Leijen at Microsoft Research, with algebraic effects and row-polymorphic effect types at its core. It represents the most complete, production-oriented implementation of the theory and is the single most relevant reference point for a JavaScript library.
+[133] [Normal] Key Design Features
+[134] [List Paragraph] Row-polymorphic effect types: Every function's type signature explicitly tracks what effects it may perform — e.g., (int) -> <async, exn> int. No hidden side effects are possible.
+[135] [List Paragraph] Evidence passing compilation: Koka avoids runtime stack manipulation by passing evidence (lightweight references to handlers) as implicit function arguments. This compiles to efficient C with no garbage collector pressure.
+[136] [List Paragraph] Async/await as a library: Koka implements async/await, cancellation, and timeout as a user-space library on top of effect handlers — not as built-in syntax. This demonstrates the power of the primitive.
+[137] [List Paragraph] Compiles to JavaScript: Koka's cooperative concurrency model maps naturally to the JS event loop — it already compiles to JavaScript for browser deployment.
+[138] [List Paragraph] Performance: Koka often outperforms mature systems including C++ in algebraic-effect-heavy benchmarks, due to Perceus reference counting and in-place mutation optimization.
+[139] [Normal] 
+[140] [Normal] // Koka: defining and handling an async effect
+[141] [Normal] effect async
+[142] [Normal]   ctl yield-task( task : () -> <async|e> a ) : a
+[143] [Normal]  
+[144] [Normal] // Cancellable fetch with timeout — entirely user-space, no runtime magic
+[145] [Normal] fun fetch-with-timeout( url : string, ms : int ) : <async,exn> response
+[146] [Normal]   with timeout(ms)  // handler that cancels after ms milliseconds
+[147] [Normal]   fetch(url)        // performs the async fetch effect
+[148] [Normal]  
+[149] [Normal] // Effect type: <async,exn> means this function may perform async AND exn effects
+[150] [Normal] // The caller sees exactly what effects this function can perform — in the type!
+[151] [Normal] 
+[152] [Normal] 
+[153] [Heading 2] 3.2 OCaml 5 (Multicore OCaml) — Industrial-Strength Effects
+[154] [Normal] OCaml 5.0 (released 2022) merged the Multicore OCaml project, introducing native algebraic effect handlers as the primary concurrency mechanism — the first mainstream systems language to do so. The retrofitting of effect handlers onto an existing language without breaking backward compatibility is directly analogous to the challenge of building a JS library.
+[155] [Normal] Key Design Choices
+[156] [List Paragraph] One-shot continuations only (by design): Enforces linearity at runtime, preventing double-resume bugs. This restriction improves performance dramatically.
+[157] [List Paragraph] Shallow vs. deep handlers: OCaml supports both. Deep handlers automatically handle recursive continuations; shallow handlers handle just one step, enabling more control.
+[158] [List Paragraph] Fibers as stack segments: Continuations are implemented as heap-allocated fiber stacks that grow on demand, supporting millions of concurrent lightweight threads.
+[159] [List Paragraph] Eio library: Built on OCaml 5 effects, Eio provides structured concurrency (switches = scoped fiber lifetimes), direct-style IO, cancellation, and composable resource management — all in userland.
+[160] [List Paragraph] Picos framework: A scheduler-agnostic interface for fibers, enabling structured and unstructured concurrency to coexist and interoperate without coupling to a specific runtime.
+[161] [Normal] 
+[162] [Heading 2] 3.3 Eff — The Research Prototype (Academic Ceiling)
+[163] [Normal] Eff is a research language (Andrej Bauer & Matija Pretnar, University of Ljubljana) that served as the original experimental ground for algebraic effects and handlers. It supports multi-shot continuations and has strongly influenced all subsequent implementations. While not production-ready, Eff defines the theoretical ceiling of what algebraic effects can express.
+[164] [List Paragraph] Multi-shot continuations: A handler can invoke the same continuation multiple times, enabling backtracking search, probabilistic branching, and save/load semantics.
+[165] [List Paragraph] Effect inference: Eff infers effect types automatically — you do not need to annotate every function.
+[166] [List Paragraph] Deep influence: Koka, OCaml effects, and nearly all academic papers trace back to Eff's semantics.
+[167] [Heading 2] 3.4 Unison — Effects as First-Class Values
+[168] [Normal] Unison, a content-addressed programming language, treats algebraic effects ("abilities") as a core language feature. Like Eff, it supports multi-shot continuations, allowing a handler to invoke a captured continuation multiple times — enabling co-operative multithreading, backtracking, and "forking the universe" computations. Unison's type system tracks abilities the same way Koka tracks effects.
+[169] [Heading 2] 3.5 Effekt (Scala/JVM) — Effects Without Type-Level Madness
+[170] [Normal] Effekt is a Scala library and research language (Brachthäuser, Schuster, Ostermann) that achieves effect safety and effect polymorphism through capability passing and intersection types — without complex type-level programming (no type classes, no HKTs). It implements multi-prompt delimited continuations via JVM bytecode transformation (CPS transformation at the bytecode level), enabling direct-style async without language changes.
+[171] [Normal] 
+[172] [Heading 2] 3.6 Language Comparison Matrix
+[173] [Normal] 
+[174] [Normal] 
+[175] [Heading 1] 4. Existing JavaScript / TypeScript Libraries — Complete Survey (Updated April 2026)
+[176] [Normal] As of April 2026, the JavaScript effects ecosystem has advanced significantly. Effect has released a major v4 beta, Effection has shipped v4, and new patterns have emerged. This section documents all major libraries with their current status, strengths, and critical gaps.
+[177] [Heading 2] 4.1 Effect-TS (the "effect" package) — Updated: v4 Beta (February 2026)
+[178] [Normal] Effect-TS is the most mature and comprehensive functional effects library in the TypeScript ecosystem. It has rapidly grown into a complete application framework. As of April 2026, Effect v4 is in beta — the most ambitious release yet, with a rewritten runtime, significantly smaller bundles, and a unified package ecosystem.
+[179] [Heading 3] Effect v4 Beta — What Changed (February 2026)
+[180] [List Paragraph] Rewritten fiber runtime: The core fiber runtime has been rewritten from scratch for lower memory overhead, faster execution, and simpler internals. Every Effect application benefits from these optimizations immediately.
+[181] [List Paragraph] Dramatic bundle size reduction: A minimal program using Effect, Stream, and Schema drops from ~70 KB (v3) to ~20 KB (v4). The core effect package with aggressive tree-shaking bundles to ~6.3 KB minified + gzipped.
+[182] [List Paragraph] Unified versioning: All ecosystem packages now share a single version number and are released together. In v3, packages were versioned independently, making compatibility difficult to track.
+[183] [List Paragraph] Unstable modules (effect/unstable/*): 17 unstable modules now ship inside the core effect package: AI, CLI, cluster, devtools, eventlog, HTTP, httpapi, jsonschema, observability, persistence, process, reactivity, RPC, schema, SQL, workflow, workers.
+[184] [List Paragraph] @effect/ai SDK: Released as an alpha alongside v4. The Effect AI SDK brings algebraic effect patterns to AI agent orchestration — structured concurrency for LLM calls, typed error handling for model failures, fiber-based parallelism for multi-agent systems.
+[185] [Normal] 
+[186] [Normal] // Effect v4: the new unified import pattern
+[187] [Normal] import { Effect, Stream, Schema } from "effect"                    // core
+[188] [Normal] import { HttpClient, HttpRouter } from "effect/unstable/http"       // unstable HTTP
+[189] [Normal] import { Sql } from "@effect/sql-pg"                               // SQL (v4 versioned)
+[190] [Normal]  
+[191] [Normal] // Effect v4 AI agent orchestration (new in 2026)
+[192] [Normal] import { Ai, AiModel, AiError } from "effect/unstable/ai"
+[193] [Normal]  
+[194] [Normal] const orchestrateAgents = Effect.gen(function* () {
+[195] [Normal]   // Structured concurrency for parallel LLM calls
+[196] [Normal]   const [analysis, summary] = yield* Effect.all({
+[197] [Normal]     analysis: Ai.generateText({ model: "claude-3-5", prompt: analysisPrompt }),
+[198] [Normal]     summary:  Ai.generateText({ model: "gpt-4o",    prompt: summaryPrompt }),
+[199] [Normal]   }, { concurrency: "unbounded" })
+[200] [Normal]   // If either fails: both are cancelled. No ghost tasks.
+[201] [Normal]   return { analysis, summary }
+[202] [Normal] }).pipe(
+[203] [Normal]   Effect.retry(Schedule.exponential("100 millis", { times: 3 })),
+[204] [Normal]   Effect.timeout("30 seconds"),
+[205] [Normal] )
+[206] [Normal] 
+[207] [Heading 3] Critical Gaps (Still Present in v4)
+[208] [List Paragraph] Monadic encoding, not true algebraic effects: Effect-TS v4 is still built on monads (the IO monad pattern from Haskell), not on resumable delimited continuations. You cannot "resume from where you performed an effect" — you describe workflows as data structures that are interpreted later.
+[209] [List Paragraph] No true multi-shot continuations: Effect-TS fibers are one-way — once you fork or schedule, there is no handler that can resume the same computation from a different point.
+[210] [List Paragraph] Function color problem remains: Code written in Effect style is not interoperable with ordinary Promise-based code without explicit bridging. The "async plague" is replaced with the "Effect plague."
+[211] [List Paragraph] Steep learning curve: Even with v4's improvements, Effect requires a paradigm shift to functional, value-oriented programming. Teams without FP background find initial adoption slow.
+[212] [List Paragraph] Restricted environment edge cases: v4 beta introduced a keepAlive mechanism (globalThis.setInterval) that breaks in restricted runtimes like Convex — resolved in later beta versions, but illustrates the challenge of portability.
+[213] [Normal] 
+[214] [Heading 2] 4.2 Effection — v4 Released (December 2025)
+[215] [Normal] Effection (from the Frontside team) takes a different philosophy from Effect-TS: rather than introducing a new paradigm, it extends JavaScript's existing concurrency primitives with structured concurrency semantics while feeling as native as possible. Effection v4 was released in December 2025, addressing v3's key limitations.
+[216] [Heading 3] Effection v4 — What Changed (December 2025)
+[217] [List Paragraph] Parent-task priority: In v4, a parent task always has priority over its children. This makes task execution more predictable and allows parents to supervise children properly. This changes execution ordering from v3.
+[218] [List Paragraph] Explicit scope management: v4 introduces explicit scope boundaries. In v3, new scopes were created as a by-product of action()/call()/spawn() — confusing users. In v4, scope boundaries are first-class and visible.
+[219] [List Paragraph] Native JavaScript stack traces: Effection v4 programs "live and breathe on the JavaScript stack" — stack traces are native, readable by IDEs, LSPs, and debuggers. This was a major complaint about v3 and most effects libraries.
+[220] [List Paragraph] EffectionX Extensions: Ready-to-use libraries for common patterns: WebSockets with automatic cleanup, process management, worker threads with structured concurrency. Work with both v3 and v4.
+[221] [List Paragraph] Back-ported to v3.2.0+: The native stack trace feature was back-ported to Effection v3.2.0 so existing apps can benefit without migrating.
+[222] [Normal] 
+[223] [Normal] // Effection v4: structured concurrency with native JS stack traces
+[224] [Normal] import { main, call, sleep, spawn, race } from "effection";
+[225] [Normal]  
+[226] [Normal] await main(function* () {
+[227] [Normal]   // Structured concurrency: tasks cannot outlive their parent scope
+[228] [Normal]   const result = yield* race([
+[229] [Normal]     call(function* timeout() {
+[230] [Normal]       yield* sleep(5000);
+[231] [Normal]       return 'timeout';
+[232] [Normal]     }),
+[233] [Normal]     call(function* fetchData() {
+[234] [Normal]       const data = yield* call(fetch('/api/data'));
+[235] [Normal]       return data;
+[236] [Normal]     })
+[237] [Normal]   ]);
+[238] [Normal]   // When one wins, the other is AUTOMATICALLY cancelled — guaranteed.
+[239] [Normal]   // Stack traces show the actual function names: timeout, fetchData, main.
+[240] [Normal]   console.log(result);
+[241] [Normal] });
+[242] [Normal] 
+[243] [Heading 3] Critical Gaps (Still Present in v4)
+[244] [List Paragraph] No typed effects: Effects remain untyped — the TypeScript type system does not track what effects a function may perform or require.
+[245] [List Paragraph] No multi-shot continuations: Effection is one-shot only — once a fiber suspends and resumes, the old continuation is gone.
+[246] [List Paragraph] Generator syntax friction: Requiring function* and yield* for every async operation creates friction compared to async/await, though the Rosetta Stone documentation helps.
+[247] [List Paragraph] Limited error unification: No typed error channel distinguishing expected vs. unexpected failures.
+[248] [Normal] 
+[249] [Heading 2] 4.3 Other Libraries — Status Update 2026
+[250] [Normal] 
+[251] [Normal] 
+[252] [Heading 1] 5. Academic Research Landscape — Complete Bibliography with Annotations
+[253] [Normal] The academic literature on algebraic effects is rich and directly applicable to a JavaScript implementation. This section catalogues all relevant papers with annotations explaining their practical relevance to the library you are building.
+[254] [Heading 2] 5.1 Foundational Papers (Mandatory Reading)
+[255] [Heading 3] Plotkin & Power — Algebraic Operations and Generic Effects (2003)
+[256] [Normal] The mathematical origin of the entire field. Establishes the categorical semantics of algebraic effects — that computational effects can be modelled as operations of an algebraic theory, and that programs are free models of these theories. Every subsequent paper builds on this foundation. Essential for understanding why effects compose when monads do not.
+[257] [Heading 3] Plotkin & Pretnar — Handling Algebraic Effects (2009/2013)
+[258] [Normal] Introduces effect handlers as the operational mechanism — the catch-like construct that intercepts effects and receives the delimited continuation. This paper defines the core semantics your library will implement. The 2009 version appeared at ESOP; the expanded 2013 version appeared in Logical Methods in Computer Science. Both are essential reading.
+[259] [Heading 3] Bauer & Pretnar — Programming with Algebraic Effects and Handlers (2015)
+[260] [Normal] The operational introduction, using the Eff language. Concrete programming examples showing how exceptions, generators, async, state, and non-determinism are all special cases of algebraic effects with handlers. The most accessible entry point to the theory for working programmers.
+[261] [Heading 2] 5.2 Implementation & Compilation Papers
+[262] [Heading 3] Leijen — Algebraic Effects for Functional Programming (MSR-TR-2016-29)
+[263] [Normal] Daan Leijen's Microsoft Research technical report presenting Koka's implementation strategy — evidence passing, row-polymorphic types, and efficient compilation to C. Directly applicable to compiling to JavaScript. The evidence-passing strategy is the most important insight for building a zero-overhead TypeScript library. Available at microsoft.com/en-us/research.
+[264] [Heading 3] Leijen — Type Directed Compilation of Row-Typed Algebraic Effects (POPL 2017)
+[265] [Normal] Formal treatment of Koka's type system. Shows how effect rows (tracking which effects a function may perform) can be compiled to efficient evidence-passing code without runtime overhead. The theoretical foundation for TypeScript effect row encoding via intersection types.
+[266] [Heading 3] Sivaramakrishnan et al. — Retrofitting Effect Handlers onto OCaml (PLDI 2021)
+[267] [Normal] The definitive paper on how OCaml 5 was engineered. Covers the implementation of fibers as heap-allocated stack segments, design of one-shot continuations, DWARF compatibility, and benchmarks against monadic libraries. arXiv:2104.00250. Critical reading for understanding the tradeoffs between one-shot and multi-shot implementations.
+[268] [Heading 3] Dolan et al. — Concurrent System Programming with Effect Handlers (2018)
+[269] [Normal] Demonstrates that effect handlers can express difficult concurrent programs (web servers, co-operative multithreading) at performance parity with optimized monadic libraries. Validates the practical viability of effects for systems programming.
+[270] [Heading 3] Brachthäuser, Schuster, Ostermann — Effect Handlers for the Masses (OOPSLA 2018)
+[271] [Normal] Introduces the Effekt language and its capability-passing approach. Achieves effect polymorphism and safety without type-level programming, making the model accessible to mainstream developers. This ergonomics insight should directly inform your API design — capability passing is how you get type safety without complex row-polymorphic types in TypeScript.
+[272] [Heading 2] 5.3 Directly Relevant to JavaScript Implementation
+[273] [Heading 3] Kawahara & Kameyama — One-Shot Algebraic Effects as Coroutines (TFP 2020)
+[274] [Normal] Proves that one-shot algebraic effects are macro-expressible as asymmetric coroutines (and vice versa is not true). Since JavaScript generators are asymmetric coroutines, this paper provides the theoretical foundation and proof of correctness for implementing one-shot effects via generators. Essential reading before writing the first line of implementation code.
+[275] [Heading 3] Cong & Asai — Expressive Power of One-Shot Control Operators and Coroutines (APLAS 2023)
+[276] [Normal] Extends the Kawahara & Kameyama result. Provides a rigorous mathematical comparison of one-shot effect handlers, delimited continuations, and coroutines. Confirms that generators (asymmetric coroutines) are strictly less expressive than multi-shot effect handlers, and that one-shot effects and coroutines are equivalent. Key theoretical grounding for your Phase 1 (generator-based) vs Phase 3 (multi-shot) design decision.
+[277] [Heading 3] Ahman & Pretnar — Asynchronous Effects (LMCS 2024, arXiv:2307.13795)
+[278] [Normal] Directly relevant to the JavaScript problem. Explores asynchronous algebraic effects — decoupling the signalling of an effect from its resolution, enabling non-blocking operation calls. Includes a prototype in OCaml and Agda type-safety proofs. This is the theoretical model for your "async effects" feature: a perform call that does not block the calling fiber while the effect is being resolved.
+[279] [Heading 3] Zhang, Salvaneschi & Myers — Handling Bidirectional Control Flow (OOPSLA 2020, Cornell)
+[280] [Normal] Introduces bidirectional algebraic effects — extending the model so that generators (async iterators) and async/await can interact bidirectionally. Proves that all declared effects are handled and none are accidentally handled. Available at cs.cornell.edu/andru/papers/ufo/bidirectional-effects.pdf. Critical for the Phase 3 async iterator integration.
+[281] [Heading 2] 5.4 Newest Research (2024–2026) — Not in Original Document
+[282] [Heading 3] Ma & Zhang — Lexical Effect Handlers: Fast by Design, Correct by Proof (OOPSLA 2025)
+[283] [Normal] Published at SPLASH/OOPSLA 2025. Introduces Lexical Effect Handlers — a restriction of algebraic effect handlers that enables significant performance improvements (equivalent to direct-style programming) while maintaining correctness guarantees. The "lexical" restriction means handlers are lexically visible, enabling ahead-of-time optimization. Directly applicable to a TypeScript implementation that wants zero-overhead hot paths.
+[284] [Heading 3] Kammar, McCusker, Phipps-Costin & Lindley — Equational Axiomatization of Dynamic Threads (POPL 2026)
+[285] [Normal] Published at POPL 2026. Provides an equational axiomatization of dynamic threads via algebraic effects, using presheaves on finite relations. Establishes the formal semantic foundations for concurrent algebraic effects — directly relevant to structured concurrency semantics in your library. arXiv citation: 2026 POPL proceedings.
+[286] [Heading 3] Phipps-Costin et al. — Continuing WebAssembly with Effect Handlers (OOPSLA 2023 — Implementation Advancing)
+[287] [Normal] Introduces WasmFX — effect handlers for WebAssembly. As of 2025, WasmFX is being standardized in the WebAssembly Stack Switching subgroup. An implementation exists in wasmtime and wasm-tools. V8 and SpiderMonkey implementations are being tracked. This is the platform-level primitive your library may eventually be able to exploit for true native performance.
+[288] [Heading 2] 5.5 WasmFX & Stack Switching — The Platform Horizon
+[289] [Normal] WasmFX extends WebAssembly with effect handlers as a unifying mechanism to enable efficient compilation of control idioms: async/await, generators/iterators, first-class continuations, lightweight threads. The design adds only three main instructions: cont.new (create a continuation), resume (run a continuation under a handler), and suspend (suspend with a tag to the nearest handler).
+[290] [List Paragraph] Standardization status (2025): WasmFX is being considered as the basis for "stack switching" in WebAssembly. The proposal is known as "typed continuations." Active discussion in the WebAssembly Stack Switching subgroup.
+[291] [List Paragraph] Implementations: Wasmtime (Rust-based Wasm runtime) and wasm-tools both have WasmFX implementations. Browser implementations are not yet available.
+[292] [List Paragraph] Strategic implication for your library: Once WasmFX is standardized and browser-supported, a JavaScript library built on WasmFX continuations could achieve true native algebraic effects semantics — not via generator polyfills, but via actual platform-level delimited continuations. Build the library now; design the API with WasmFX as the eventual backend in mind.
+[293] [Normal] 
+[294] [Normal] 
+[295] [Normal] 
+[296] [Heading 1] 6. Implementation Strategy for Your Library
+[297] [Normal] This section provides a detailed, technically grounded implementation roadmap based on the academic literature, lessons from existing libraries, and the unique constraints of the JavaScript/TypeScript ecosystem.
+[298] [Heading 2] 6.1 Core Design Decisions
+[299] [Heading 3] Decision 1: Generator-Based Delimited Continuations (Phase 1)
+[300] [Normal] JavaScript generators (function*) are the natural implementation substrate for one-shot delimited continuations. A suspended generator IS a delimited continuation — it represents the "rest of the computation" from the yield point. The theoretical basis is Kawahara & Kameyama (TFP 2020): one-shot effects and asymmetric coroutines are equivalent in expressiveness.
+[301] [Normal] 
+[302] [Normal] // Core implementation concept (simplified)
+[303] [Normal] function withHandler<T>(handler: Handler, thunk: () => Generator): T {
+[304] [Normal]   const gen = thunk();
+[305] [Normal]   let result = gen.next();
+[306] [Normal]   while (!result.done) {
+[307] [Normal]     const effect = result.value;           // the 'perform' call
+[308] [Normal]     const continuation = (v: any) => gen.next(v);  // delimited continuation
+[309] [Normal]     const resume = handler.handle(effect, continuation);
+[310] [Normal]     result = gen.next(resume);
+[311] [Normal]   }
+[312] [Normal]   return result.value;
+[313] [Normal] }
+[314] [Normal]  
+[315] [Normal] // Usage: transparent to business logic
+[316] [Normal] function* fetchUser(id: number) {
+[317] [Normal]   const user = yield { type: 'Fetch', url: `/api/users/${id}` };
+[318] [Normal]   return user;
+[319] [Normal] }
+[320] [Normal]  
+[321] [Normal] // Test: swap handler transparently
+[322] [Normal] const mockHandler = { handle: (e, k) => k({ id: 1, name: 'Mock User' }) };
+[323] [Normal] const realHandler = { handle: (e, k) => fetch(e.url).then(r => r.json()).then(k) };
+[324] [Normal] 
+[325] [Heading 3] Decision 2: TypeScript Effect Row Encoding via Intersection Types
+[326] [Normal] While full row-polymorphic effect types (as in Koka) require language-level support, a workable approximation exists using TypeScript's type system — specifically intersection types and conditional types, inspired by Effekt's capability-passing approach.
+[327] [Normal] 
+[328] [Normal] // TypeScript encoding of effect rows via intersection types
+[329] [Normal] type EffectRow = FetchEffect | LogEffect | CancelEffect | never;
+[330] [Normal]  
+[331] [Normal] // An Effect is a generator that may yield effect signals
+[332] [Normal] type Effect<A, E extends EffectRow = never> = Generator<E, A>;
+[333] [Normal]  
+[334] [Normal] // A function declares what effects it performs
+[335] [Normal] function* getUser(id: number): Effect<User, FetchEffect | LogEffect> {
+[336] [Normal]   yield { type: 'Log',   msg: `Fetching user ${id}` };   // LogEffect
+[337] [Normal]   const user = yield { type: 'Fetch', url: `/api/${id}` }; // FetchEffect
+[338] [Normal]   return user as User;
+[339] [Normal] }
+[340] [Normal]  
+[341] [Normal] // Handler eliminates effects from the row (type narrowing)
+[342] [Normal] function withFetchAndLog<T>(
+[343] [Normal]   fn: () => Effect<T, FetchEffect | LogEffect>
+[344] [Normal] ): Effect<T, never> {   // <-- no more effects in the row!
+[345] [Normal]   return runEffect(fn(), realFetchHandler, consoleLogHandler);
+[346] [Normal] }
+[347] [Normal] 
+[348] [Heading 3] Decision 3: Structured Concurrency as an Algebraic Effect
+[349] [Normal] Spawn and cancel are themselves effects, not primitives. This is the key insight from Effection and from the OCaml Eio library. A Spawn effect is performed to start a child task; a Cancel effect is performed to cancel a task. The structured concurrency guarantees come from the handler, not from the runtime — making the entire concurrency model testable and composable.
+[350] [Normal] 
+[351] [Normal] // Structured concurrency as algebraic effects
+[352] [Normal] type SpawnEffect<T> = { kind: 'spawn', task: () => Effect<T, any> }
+[353] [Normal] type CancelEffect   = { kind: 'cancel', taskId: TaskId }
+[354] [Normal] type JoinEffect<T>  = { kind: 'join',   tasks: TaskId[] }
+[355] [Normal]  
+[356] [Normal] function* fetchBoth(urlA: string, urlB: string): Effect<[Response, Response], SpawnEffect<any> | CancelEffect> {
+[357] [Normal]   const taskA = yield { kind: 'spawn', task: () => fetchUrl(urlA) };
+[358] [Normal]   const taskB = yield { kind: 'spawn', task: () => fetchUrl(urlB) };
+[359] [Normal]   try {
+[360] [Normal]     const [a, b] = yield { kind: 'join', tasks: [taskA, taskB] };
+[361] [Normal]     return [a, b];
+[362] [Normal]   } catch (e) {
+[363] [Normal]     yield { kind: 'cancel', taskId: taskA };  // guaranteed cleanup
+[364] [Normal]     yield { kind: 'cancel', taskId: taskB };  // guaranteed cleanup
+[365] [Normal]     throw e;
+[366] [Normal]   }
+[367] [Normal] }
+[368] [Normal] 
+[369] [Heading 2] 6.2 Architecture Overview
+[370] [Normal] 
+[371] [Heading 2] 6.3 Critical Gaps to Fill Over Existing Work
+[372] [List Paragraph] Multi-shot continuations via generator cloning: effects.js has a prototype. The gap is a production-quality, typed, GC-safe implementation. The Eff language semantics paper (Bauer & Pretnar 2015) provides the reference implementation.
+[373] [List Paragraph] Typed effect rows in TypeScript: No existing library does this properly. The key research is Leijen 2017 (row types) + Brachthäuser 2018 (capability passing) + TypeScript intersection types.
+[374] [List Paragraph] Async effects (Ahman & Pretnar 2024 model): Decoupling signal from resolution — allowing a computation to proceed while an effect is being handled asynchronously. Not implemented in any JS library.
+[375] [List Paragraph] Bidirectional effects (Zhang 2020): Enabling async iterators and effect handlers to interact bidirectionally. Not implemented in any JS library.
+[376] [List Paragraph] Lexical Effect Handler optimization (Ma & Zhang 2025): The latest research shows that restricting handlers to lexically visible scopes enables proof-bearing zero-overhead compilation. A TypeScript implementation of this restriction would dramatically improve hot-path performance.
+[377] [List Paragraph] Zero-overhead testing: The killer feature missing from all existing libraries: a seamless "run with mock handlers" story that requires ZERO changes to the code under test. Not even a test helper import. Just swap the handler.
+[378] [List Paragraph] WasmFX backend (Phase 4+): Design the API now so that the generator-based implementation can be transparently replaced with a WasmFX backend when browsers support it. The API surface should not change.
+[379] [Normal] 
+[380] [Normal] 
+[381] [Heading 1] 7. New Frontier: Algebraic Effects for AI Agent Orchestration (2026)
+[382] [Normal] A new and rapidly growing use case has emerged in 2025–2026: algebraic effects as the natural primitive for AI agent orchestration. This section explores why effects are uniquely well-suited to AI agent systems and how the ecosystem is already converging on this pattern.
+[383] [Heading 2] 7.1 Why AI Agents Need Algebraic Effects
+[384] [Normal] Modern AI agent systems face exactly the same structural problems as JavaScript's async model — amplified by orders of magnitude:
+[385] [List Paragraph] Non-deterministic execution: LLM calls may succeed, fail, hallucinate, or timeout. Error propagation must be typed and composable.
+[386] [List Paragraph] Parallel tool calls: Agents routinely call multiple tools in parallel. Without structured concurrency, failed tool calls leave ghost tasks consuming API rate limits.
+[387] [List Paragraph] Retry and backoff: Every LLM provider requires retry logic. This is a natural algebraic effect — the business logic just "performs a Generate effect"; the handler decides retry policy.
+[388] [List Paragraph] Dependency injection for models: Tests should run against a mock LLM, production against a real one. Effect handlers make this trivial — same code, different handler.
+[389] [List Paragraph] Stateful multi-step workflows: Agent workflows with memory, tool use, and reflection are complex state machines. Algebraic effects are the natural primitive for expressing this.
+[390] [List Paragraph] Observability: Every LLM call is an "effect." Wrapping effects with logging, tracing, and cost tracking is trivial — just compose the handler.
+[391] [Normal] 
+[392] [Heading 2] 7.2 Current State: Effect-TS for AI Agents
+[393] [Normal] The Effect-TS team recognized this opportunity and released the @effect/ai SDK in 2025. Community projects have further explored the pattern:
+[394] [List Paragraph] Lalph (Effect-TS): A Ralph-inspired AI agent orchestrator built with Effect, demonstrating structured concurrency for multi-agent systems with automatic cleanup.
+[395] [List Paragraph] DynamicFlow: An Effect-based framework that generates complete LLM execution graphs at runtime, with fiber-based scheduling and typed error propagation.
+[396] [List Paragraph] Injectio: An Effect package that transforms React rendering into effects — enabling AI-generated UI with structured concurrency semantics.
+[397] [List Paragraph] Effect + Claude Code observation (March 2026): The Effect-TS community noted that Effect's strict compiler makes AI-assisted development more reliable: the compiler forces AI agents to reason about errors and concurrency upfront, reducing hallucinated code.
+[398] [Normal] 
+[399] [Normal] // What agent orchestration looks like with true algebraic effects
+[400] [Normal] // (hypothetical native JS syntax — your library can approximate this)
+[401] [Normal]  
+[402] [Normal] effect AgentEffects {
+[403] [Normal]   operation generate(prompt: string, model: Model): string
+[404] [Normal]   operation useTool(name: string, args: unknown): ToolResult
+[405] [Normal]   operation remember(key: string, value: unknown): void
+[406] [Normal]   operation recall(key: string): unknown
+[407] [Normal] }
+[408] [Normal]  
+[409] [Normal] function* researchAgent(query: string): Effect<Report, AgentEffects> {
+[410] [Normal]   const plan = yield* generate(`Plan research for: ${query}`, Model.Fast);
+[411] [Normal]   const [webResults, docs] = yield* Effect.all({
+[412] [Normal]     webResults: useTool('web_search', { query }),
+[413] [Normal]     docs:       useTool('doc_retrieval', { query }),
+[414] [Normal]   }, { concurrency: 'unbounded' });
+[415] [Normal]   yield* remember('research_context', { plan, webResults, docs });
+[416] [Normal]   const report = yield* generate(synthesisPrompt(plan, webResults, docs), Model.Smart);
+[417] [Normal]   return { content: report, sources: [webResults, docs] };
+[418] [Normal] }
+[419] [Normal]  
+[420] [Normal] // Swap handler for testing — zero changes to business logic:
+[421] [Normal] const testHandler = AgentEffects.handler({
+[422] [Normal]   generate: async (prompt) => mockLLMResponse(prompt),
+[423] [Normal]   useTool:  async (name, args) => mockToolResult(name, args),
+[424] [Normal]   remember: () => {},
+[425] [Normal]   recall:   () => undefined,
+[426] [Normal] });
+[427] [Normal] 
+[428] [Normal] 
+[429] [Normal] 
+[430] [Heading 1] 8. TC39 Standardization Status & Platform Developments (April 2026)
+[431] [Heading 2] 8.1 TC39 — No Proposal for Algebraic Effects
+[432] [Normal] As of April 2026, there is no formal TC39 proposal for algebraic effects in JavaScript at any stage of the standardization process. The ECMAScript 2025 (16th edition) introduced Array.fromAsync, Error.isError, and explicit resource management with using. The February 2026 TC39 meeting advanced Float16Array, RegExp.escape, and Duplicate Named Capture Groups to Stage 4. None address the fundamental async control flow limitations.
+[433] [Normal] The barriers to a TC39 proposal for algebraic effects remain substantial:
+[434] [List Paragraph] Engine implementation complexity: Delimited continuations require fundamental changes to how V8, SpiderMonkey, and JavaScriptCore manage call stacks. These engines would all need significant modifications.
+[435] [List Paragraph] Backward compatibility: Any syntax for perform or handle must not conflict with existing valid JavaScript identifiers and patterns. The esdiscuss.org archives from 2016 show Sebastian Markbåge first raising this with TC39 — it generated discussion but no action.
+[436] [List Paragraph] Multi-shot semantics with SharedArrayBuffer: Multi-shot continuations have unclear semantics in the presence of shared mutable state — a show-stopper for browsers with SharedArrayBuffer enabled.
+[437] [List Paragraph] Performance concerns: Capturing and preserving continuations is more expensive than stack unwinding. The performance impact on the vast majority of JavaScript code that does not use effects must be demonstrably minimal.
+[438] [Normal] 
+[439] [Heading 2] 8.2 What TC39 IS Working On (Adjacent Developments)
+[440] [List Paragraph] Explicit resource management (using / await using): Now at Stage 4. Provides deterministic cleanup for resources — a partial solution to the structured lifetime problem. Not resumable, but solves resource leak issues.
+[441] [List Paragraph] TypeScript compiler rewrite in Go: Microsoft is rewriting tsc and tsserver in TypeScript 6.0 will be the last TypeScript-based version. Future versions in Go should offer 10x performance improvement. This opens the door for more sophisticated type-level effect tracking without performance penalty.
+[442] [List Paragraph] Node.js native TypeScript (since Node.js 22.18.0, July 2025): Node.js now natively supports TypeScript — no build step needed. This reduces the barrier to adopting TypeScript-first libraries like yours.
+[443] [Normal] 
+[444] [Heading 2] 8.3 WasmFX as the Platform Path
+[445] [Normal] The most credible path to native algebraic effects in the browser runs through WebAssembly, not TC39. WasmFX (the "stack switching" / "typed continuations" proposal) provides delimited continuations at the WebAssembly level. If this proposal is standardized and implemented in V8 and SpiderMonkey, it would become possible to expose delimited continuations to JavaScript via a thin API — at near-native performance.
+[446] [Normal] 
+[447] [Normal] 
+[448] [Heading 1] 9. Startup Strategy — Open Source Community Path
+[449] [Heading 2] 9.1 Market Assessment
+[450] [Normal] 
+[451] [Heading 2] 9.2 Target Audience
+[452] [Normal] 
+[453] [Heading 2] 9.3 Differentiation from Effect-TS
+[454] [Normal] 
+[455] [Heading 2] 9.4 Development Roadmap
+[456] [Heading 3] Phase 1 — Foundation (Weeks 1–3): Publish & Build Community
+[457] [List Paragraph] Core library: one-shot effects via generators, basic handler system, TypeScript effect row types
+[458] [List Paragraph] Publish on npm, GitHub with comprehensive README, architecture docs, and interactive examples
+[459] [List Paragraph] Blog post series: "Algebraic Effects for JS Developers" — educate the community with concrete examples
+[460] [List Paragraph] Announce on Hacker News, Reddit r/javascript, Discord servers for TypeScript, Effect-TS, Effection
+[461] [List Paragraph] Target: 500 GitHub stars, 5 community contributors, 10 npm downloads/day
+[462] [Heading 3] Phase 2 — Structured Concurrency (Weeks 3–6)
+[463] [List Paragraph] Task groups, scopes, structured lifetimes (OCaml Eio model — see Sivaramakrishnan 2021)
+[464] [List Paragraph] First-class cancellation as an algebraic effect (not as an AbortController bolt-on)
+[465] [List Paragraph] Typed error channels — unify throw/reject/Result into a single typed mechanism
+[466] [List Paragraph] AI agent integration layer — first-class LLM/tool effect types with mock handlers for testing
+[467] [List Paragraph] Documentation site, interactive playground, conference talk submission
+[468] [List Paragraph] Target: 2,000 GitHub stars, 20 contributors, adopted by 3+ AI agent projects
+[469] [Heading 3] Phase 3 — Advanced Features (Weeks 6–12)
+[470] [List Paragraph] Multi-shot continuations (generator cloning approach, informed by effects.js prototype and Eff semantics)
+[471] [List Paragraph] Effect row type inference (TypeScript compiler plugin or ts-morph transformer)
+[472] [List Paragraph] Async effects: non-blocking operation calls (Ahman & Pretnar 2024 model)
+[473] [List Paragraph] Bidirectional effects for async iterators (Zhang et al. 2020)
+[474] [List Paragraph] Lexical Effect Handler optimization (Ma & Zhang 2025) for zero-overhead hot paths
+[475] [List Paragraph] Target: 5,000 GitHub stars, widely cited, adopted by a major framework (Next.js adapter, tRPC integration)
+[476] [Heading 3] Phase 4 — WasmFX Backend & Monetization
+[477] [List Paragraph] WasmFX backend: when browser Wasm stack switching lands, provide a transparent drop-in backend for true native performance
+[478] [List Paragraph] DevTools: effect inspector, visualizer, performance profiler for production Effect applications
+[479] [List Paragraph] Framework integrations: Next.js, Remix, Hono, tRPC, Mastra, LangChain.js adapters
+[480] [List Paragraph] Enterprise support contracts, consulting, and SaaS monitoring dashboard
+[481] [Normal] 
+[482] [Heading 2] 9.5 Community Building Tactics
+[483] [List Paragraph] Open Issues as RFCs: Invite the community to shape the design from day one. Post "Design Discussion: Multi-shot Implementation Strategy" as an issue and tag Daan Leijen, KC Sivaramakrishnan.
+[484] [List Paragraph] Academic collaboration: Reach out to Leijen, Sivaramakrishnan, Brachthäuser, and the Effection team for feedback and endorsement. Academic backing converts skeptics.
+[485] [List Paragraph] Effect-TS interop (not competition): Build an official Effect-TS bridge adapter so Effect-TS codebases can gradually adopt your library for specific modules. Position as complementary, not a replacement.
+[486] [List Paragraph] YouTube series: "Building a Programming Language Feature from a Research Paper" — educational content that draws developers interested in PL theory and generates sustainable organic traffic.
+[487] [List Paragraph] AI agent showcase: Build a public demo agent (e.g., a research agent, a code review agent) built entirely on your library. Show the before (LangChain.js) vs. after comparison to illustrate the ergonomic advantage.
+[488] [Normal] 
+[489] [Normal] 
+[490] [Heading 1] 10. Risk Analysis & Mitigations
+[491] [Normal] 
+[492] [Normal] 
+[493] [Heading 1] 11. Conclusions and Recommendations
+[494] [Normal] This report has traced the complete arc of algebraic effects as they relate to JavaScript's async control flow problem — from the mathematical foundations of Plotkin & Power (2001) through the latest practical library releases of 2026. The picture that emerges is unambiguous: the problem is deep, the theory is complete, the ecosystem is actively searching for a solution, and no existing library has fully delivered it.
+[495] [Normal] 
+[496] [Heading 2] Summary of Key Findings
+[497] [List Paragraph] The problem is structural, not syntactic. JavaScript's four async failures — no cancellation, no structured concurrency, fragmented error channels, and non-resumable control flow — cannot be fixed by syntax changes alone. They require a new abstraction.
+[498] [List Paragraph] The theory is mature and production-proven. OCaml 5, Koka, Eff, and Unison demonstrate that algebraic effects work at scale. OCaml 5 is used in production systems; Koka compiles to JavaScript. The theoretical risk is zero.
+[499] [List Paragraph] The ecosystem gap is real and large. Effect-TS (v4 beta) and Effection (v4) are impressive but neither achieves the full theoretical model: neither provides resumable one-shot continuations with typed effect rows in an ergonomic, Promise-compatible package.
+[500] [List Paragraph] Platform convergence is accelerating. WasmFX is being standardized. TypeScript is getting a 10x faster compiler. Node.js natively supports TypeScript. The platform is converging toward algebraic effects.
+[501] [List Paragraph] AI agents are the killer application. The 2025–2026 AI agent boom has created massive demand for exactly the primitives that algebraic effects provide. No existing JS framework has filled this gap with a principled foundation.
+[502] [Normal] 
+[503] [Normal] 
+[504] [Heading 2] Priority Reading List for Your Team
+[505] [List Paragraph] Plotkin & Pretnar (2013) — Handling Algebraic Effects [foundational theory — read first]
+[506] [List Paragraph] Leijen MSR-TR-2016-29 — Algebraic Effects for Functional Programming [implementation strategy]
+[507] [List Paragraph] Sivaramakrishnan et al. arXiv:2104.00250 — Retrofitting Effect Handlers onto OCaml [engineering reference]
+[508] [List Paragraph] Brachthäuser et al. OOPSLA 2018 — Effect Handlers for the Masses [ergonomics & capability passing]
+[509] [List Paragraph] Kawahara & Kameyama TFP 2020 — One-Shot Effects as Coroutines [JS generator proof — essential]
+[510] [List Paragraph] Ahman & Pretnar arXiv:2307.13795 — Asynchronous Effects [async model for JS]
+[511] [List Paragraph] Ma & Zhang OOPSLA 2025 — Lexical Effect Handlers [zero-overhead optimization]
+[512] [List Paragraph] Phipps-Costin et al. OOPSLA 2023 — Continuing WebAssembly with Effect Handlers [WasmFX platform path]
+[513] [List Paragraph] yelouafi's 4-part JS series on DEV.to [best existing JS walkthrough]
+[514] [Normal] 
+[515] [Heading 2] Suggested Library Names
+[516] [List Paragraph] fx — short, memorable, evokes both "effects" and "functions"
+[517] [List Paragraph] conduct — effects are conducted by handlers; evokes orchestration
+[518] [List Paragraph] continua — continuations as the core primitive; elegant and memorable
+[519] [List Paragraph] cue — you perform a cue; the handler responds
+[520] [List Paragraph] invoke — declarative invocation with resumable handlers
+[521] [List Paragraph] resume — the defining operation; what makes algebraic effects unique
+[522] [Normal] 
+[523] [Normal] 
+[524] [Normal] Algebraic Effects for Async Control Flow in JavaScript & TypeScript — Comprehensive Research Report  |  April 2026
+[525] [Normal] Classification: Strategic Technical Research  |  Version 2.0 (Enhanced Edition)

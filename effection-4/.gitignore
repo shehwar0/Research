@@ -1,0 +1,10 @@
+!website/yarn.lock
+.DS_Store
+
+# Local Netlify folder
+.netlify
+/build/
+/node_modules/
+/.env
+/.aider*
+.agent-shell
